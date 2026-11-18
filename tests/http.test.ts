@@ -479,6 +479,15 @@ describe("Session", () => {
       expect(elapsed).toBeGreaterThanOrEqual(900); // Allow some tolerance
     });
   });
+
+  describe("Errors", () => {
+    it("should expose the libcurl code on mapped errors", async () => {
+      await expect(session.get("http://127.0.0.1:1/")).rejects.toMatchObject({
+        name: "ConnectionError",
+        curlCode: 7,
+      });
+    });
+  });
 });
 
 describe("Headers.splitRawByResponse", () => {

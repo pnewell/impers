@@ -6,6 +6,8 @@ import { CurlCode } from "../ffi/constants.js";
  */
 export class RequestException extends Error {
   cause?: Error;
+  /** libcurl error code, set when the error was mapped from one */
+  curlCode?: number;
 
   constructor(message: string, cause?: Error) {
     super(message);
@@ -310,6 +312,12 @@ export function raiseIfError(code: number): void {
  * Map curl error codes to appropriate exception types
  */
 export function mapCurlError(code: number, message?: string): RequestException {
+  const error = createCurlError(code, message);
+  error.curlCode = code;
+  return error;
+}
+
+function createCurlError(code: number, message?: string): RequestException {
   const msg = message || `libcurl error ${code}`;
 
   switch (code) {
