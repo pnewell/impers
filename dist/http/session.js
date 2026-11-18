@@ -1,0 +1,820 @@
+/**
+ * HTTP Session with connection pooling and cookie persistence
+ */
+import { Curl } from "../core/easy.js";
+import { CurlMulti, getSharedMulti } from "../core/multi.js";
+import { curl_easy_perform_async } from "../ffi/libcurl.js";
+import { CurlOpt, CurlHttpVersion, CurlAuth, CurlSslOpt } from "../ffi/constants.js";
+import { Headers } from "./headers.js";
+import { Cookies } from "./cookies.js";
+import { Response } from "./response.js";
+import { SList } from "../core/slist.js";
+import { CurlMime } from "../core/mime.js";
+import { AbortError, ImpersonateError, SessionClosed, raiseIfError, } from "../utils/errors.js";
+import { applyFingerprintOptions, setJa3Options, setAkamaiOptions, setExtraFingerprintOptions, } from "../utils/fingerprint.js";
+import { Fingerprint, FingerprintManager, resolveNativeImpersonateTarget, } from "../fingerprints.js";
+/**
+ * Session - HTTP client with connection pooling and cookie persistence
+ *
+ * Provides a high-level interface for making HTTP requests with automatic
+ * connection reuse, cookie handling, and browser impersonation support.
+ */
+export class Session {
+    multi;
+    ownMulti;
+    closed = false;
+    // Session defaults
+    _cookies;
+    _headers;
+    _baseUrl;
+    _defaults;
+    constructor(options = {}) {
+        // Create or use shared multi handle
+        if (options.maxConnections || options.maxHostConnections) {
+            this.multi = new CurlMulti({
+                maxTotalConnections: options.maxConnections,
+                maxHostConnections: options.maxHostConnections,
+                pipelining: options.http2Multiplexing !== false,
+            });
+            this.ownMulti = true;
+        }
+        else {
+            this.multi = getSharedMulti();
+            this.ownMulti = false;
+        }
+        // Initialize session-level cookies and headers
+        this._cookies = new Cookies(options.cookies);
+        this._headers = new Headers(options.headers);
+        this._baseUrl = options.baseUrl || null;
+        // Store remaining defaults
+        const defaults = { ...options };
+        delete defaults.cookies;
+        delete defaults.headers;
+        delete defaults.baseUrl;
+        delete defaults.maxConnections;
+        delete defaults.maxHostConnections;
+        delete defaults.http2Multiplexing;
+        this._defaults = defaults;
+    }
+    /**
+     * Get session cookies
+     */
+    get cookies() {
+        return this._cookies;
+    }
+    /**
+     * Get session headers
+     */
+    get headers() {
+        return this._headers;
+    }
+    /**
+     * Make an HTTP request
+     */
+    async request(method, url, options = {}) {
+        if (this.closed) {
+            throw new SessionClosed();
+        }
+        // Resolve URL with base URL and params
+        const resolvedUrl = this.resolveUrl(url, options.params);
+        // Merge options with session defaults
+        const mergedOptions = this.mergeOptions(options);
+        const signal = mergedOptions.signal;
+        if (signal?.aborted) {
+            throw new AbortError(signal.reason);
+        }
+        // Create curl handle
+        const curl = new Curl();
+        const slists = [];
+        const mimes = [];
+        let abortHandler;
+        let inCurlCallback = false;
+        const removeAbortHandler = () => {
+            if (signal && abortHandler) {
+                signal.removeEventListener("abort", abortHandler);
+                abortHandler = undefined;
+            }
+        };
+        try {
+            // Set URL
+            curl.setOpt(CurlOpt.URL, resolvedUrl);
+            // Set method
+            this.setMethod(curl, method.toUpperCase());
+            const fingerprint = this.resolveFingerprint(mergedOptions.impersonate);
+            // Set headers
+            const headerList = this.buildHeaders(mergedOptions, fingerprint);
+            // Native profiles supply their own default headers when no override exists.
+            const nativeDefaultHeaders = !fingerprint
+                && typeof mergedOptions.impersonate === "string"
+                && mergedOptions.defaultHeaders !== false;
+            // Otherwise preserve an explicitly empty acceptEncoding without letting
+            // ACCEPT_ENCODING generate a new header when enabling decoding below.
+            if (!nativeDefaultHeaders
+                && !headerList.some((header) => /^accept-encoding[:;]/i.test(header))) {
+                headerList.push("Accept-Encoding:");
+            }
+            if (headerList.length > 0) {
+                const slist = new SList();
+                headerList.forEach((h) => slist.append(h));
+                slists.push(slist);
+                curl.setOpt(CurlOpt.HTTPHEADER, slist.pointer);
+            }
+            // Set cookies
+            const cookieHeader = this.buildCookieHeader(resolvedUrl, mergedOptions);
+            if (cookieHeader) {
+                curl.setOpt(CurlOpt.COOKIE, cookieHeader);
+            }
+            // Set body
+            const mime = this.setBody(curl, method, mergedOptions);
+            if (mime) {
+                mimes.push(mime);
+            }
+            // Set authentication
+            this.setAuth(curl, mergedOptions);
+            // Set proxy
+            this.setProxy(curl, mergedOptions);
+            // Set SSL/TLS options
+            this.setSslOptions(curl, mergedOptions);
+            // Set timeouts
+            this.setTimeouts(curl, mergedOptions);
+            // Set redirects
+            this.setRedirects(curl, mergedOptions);
+            // Set HTTP version
+            this.setHttpVersion(curl, mergedOptions);
+            // Set network interface
+            this.setInterface(curl, mergedOptions);
+            // Set DNS options
+            this.setDnsOptions(curl, mergedOptions);
+            // Set impersonation
+            this.setImpersonation(curl, mergedOptions, fingerprint);
+            // Decode before the write callback so streaming and buffered bodies agree.
+            // Explicit headers above preserve the requested encoding list and order.
+            curl.setOpt(CurlOpt.ACCEPT_ENCODING, "");
+            curl.setOpt(CurlOpt.HTTP_CONTENT_DECODING, mergedOptions.decodeContent !== false ? 1 : 0);
+            // Set raw curl options
+            if (mergedOptions.curlOptions) {
+                for (const [opt, value] of Object.entries(mergedOptions.curlOptions)) {
+                    curl.setOpt(Number(opt), value);
+                }
+            }
+            // Collect response data
+            const bodyChunks = [];
+            const headerChunks = [];
+            curl.setWriteFunction((chunk) => {
+                if (signal?.aborted) {
+                    return 0;
+                }
+                inCurlCallback = true;
+                try {
+                    if (mergedOptions.contentCallback) {
+                        mergedOptions.contentCallback(chunk);
+                    }
+                    if (signal?.aborted) {
+                        return 0;
+                    }
+                    if (!mergedOptions.stream) {
+                        bodyChunks.push(Buffer.from(chunk));
+                    }
+                }
+                finally {
+                    inCurlCallback = false;
+                }
+            });
+            curl.setHeaderFunction((chunk) => {
+                if (signal?.aborted) {
+                    return 0;
+                }
+                inCurlCallback = true;
+                try {
+                    if (mergedOptions.headerCallback) {
+                        mergedOptions.headerCallback(chunk);
+                    }
+                    if (signal?.aborted) {
+                        return 0;
+                    }
+                    headerChunks.push(Buffer.from(chunk));
+                }
+                finally {
+                    inCurlCallback = false;
+                }
+            });
+            // Perform request
+            if (signal) {
+                abortHandler = () => {
+                    const error = new AbortError(signal.reason);
+                    if (!inCurlCallback) {
+                        this.multi.cancel(curl, error);
+                    }
+                };
+                signal.addEventListener("abort", abortHandler, { once: true });
+                if (signal.aborted) {
+                    throw new AbortError(signal.reason);
+                }
+            }
+            const startTime = Date.now();
+            try {
+                if (process.versions.bun) {
+                    // CurlMulti relies on libuv polling, which Bun does not implement
+                    // (oven-sh/bun#18546), so run each transfer on Koffi's thread pool.
+                    raiseIfError(await curl_easy_perform_async(curl.getHandle()));
+                }
+                else {
+                    await this.multi.perform(curl);
+                }
+            }
+            catch (error) {
+                if (signal?.aborted) {
+                    throw error instanceof AbortError ? error : new AbortError(signal.reason);
+                }
+                throw error;
+            }
+            finally {
+                removeAbortHandler();
+            }
+            const elapsed = (Date.now() - startTime) / 1000;
+            const rawHeaders = Buffer.concat(headerChunks);
+            const content = Buffer.concat(bodyChunks);
+            // Split raw headers into per-response segments for redirect history
+            const segments = Headers.splitRawByResponse(rawHeaders);
+            // Build redirect history from intermediate responses (all except last)
+            const history = [];
+            let currentUrl = resolvedUrl;
+            if (segments.length > 1) {
+                for (let i = 0; i < segments.length - 1; i++) {
+                    const seg = segments[i];
+                    const intermediateResponse = new Response({
+                        headers: seg.headers,
+                        requestUrl: currentUrl,
+                        statusCode: seg.statusCode,
+                        statusText: seg.statusText,
+                        url: currentUrl,
+                    });
+                    // Update session cookies from intermediate response
+                    for (const cookie of intermediateResponse.cookies) {
+                        this._cookies.set(cookie.name, cookie.value, cookie);
+                    }
+                    history.push(intermediateResponse);
+                    // Resolve next URL from Location header
+                    const location = seg.headers.get("location");
+                    if (location) {
+                        try {
+                            currentUrl = new URL(location, currentUrl).href;
+                        }
+                        catch {
+                            currentUrl = location;
+                        }
+                    }
+                }
+            }
+            // Use the final response headers
+            const lastSegment = segments.length > 0 ? segments[segments.length - 1] : null;
+            const response = new Response({
+                content,
+                headers: lastSegment?.headers,
+                curl,
+                requestUrl: resolvedUrl,
+                elapsed,
+                history,
+                // Pass the resolved final URL from redirect chain, in case
+                // CURLINFO_EFFECTIVE_URL doesn't reflect the redirect target
+                url: history.length > 0 ? currentUrl : undefined,
+            });
+            // Update session cookies from final response
+            for (const cookie of response.cookies) {
+                this._cookies.set(cookie.name, cookie.value, cookie);
+            }
+            return response;
+        }
+        finally {
+            // Cleanup
+            removeAbortHandler();
+            slists.forEach((s) => s.free());
+            mimes.forEach((m) => m.free());
+            curl.cleanup();
+        }
+    }
+    /**
+     * HTTP GET request
+     */
+    async get(url, options) {
+        return this.request("GET", url, options);
+    }
+    /**
+     * HTTP POST request
+     */
+    async post(url, options) {
+        return this.request("POST", url, options);
+    }
+    /**
+     * HTTP PUT request
+     */
+    async put(url, options) {
+        return this.request("PUT", url, options);
+    }
+    /**
+     * HTTP DELETE request
+     */
+    async delete(url, options) {
+        return this.request("DELETE", url, options);
+    }
+    /**
+     * HTTP HEAD request
+     */
+    async head(url, options) {
+        return this.request("HEAD", url, options);
+    }
+    /**
+     * HTTP OPTIONS request
+     */
+    async options(url, options) {
+        return this.request("OPTIONS", url, options);
+    }
+    /**
+     * HTTP PATCH request
+     */
+    async patch(url, options) {
+        return this.request("PATCH", url, options);
+    }
+    /**
+     * Close the session and release resources
+     */
+    async close() {
+        if (this.closed)
+            return;
+        this.closed = true;
+        if (this.ownMulti) {
+            await this.multi.close();
+        }
+    }
+    /**
+     * Resolve URL with base URL
+     */
+    resolveUrl(url, params) {
+        let resolvedUrl = url;
+        // Apply base URL if needed
+        if (this._baseUrl && !url.match(/^https?:\/\//)) {
+            // Relative URL - resolve against base
+            const base = this._baseUrl.endsWith("/") ? this._baseUrl.slice(0, -1) : this._baseUrl;
+            const path = url.startsWith("/") ? url : "/" + url;
+            resolvedUrl = base + path;
+        }
+        // Add query parameters
+        if (params) {
+            const urlObj = new URL(resolvedUrl);
+            if (params instanceof URLSearchParams) {
+                params.forEach((value, key) => urlObj.searchParams.append(key, value));
+            }
+            else {
+                for (const [key, value] of Object.entries(params)) {
+                    if (Array.isArray(value)) {
+                        for (const v of value) {
+                            urlObj.searchParams.append(key, String(v));
+                        }
+                    }
+                    else {
+                        urlObj.searchParams.append(key, String(value));
+                    }
+                }
+            }
+            resolvedUrl = urlObj.toString();
+        }
+        return resolvedUrl;
+    }
+    /**
+     * Merge request options with session defaults
+     */
+    mergeOptions(options) {
+        return {
+            ...this._defaults,
+            ...options,
+            headers: options.headers, // Will be merged separately with session headers
+        };
+    }
+    /**
+     * Set HTTP method
+     */
+    setMethod(curl, method) {
+        switch (method) {
+            case "GET":
+                curl.setOpt(CurlOpt.HTTPGET, 1);
+                break;
+            case "POST":
+                curl.setOpt(CurlOpt.POST, 1);
+                break;
+            case "HEAD":
+                curl.setOpt(CurlOpt.NOBODY, 1);
+                break;
+            case "PUT":
+                curl.setOpt(CurlOpt.CUSTOMREQUEST, "PUT");
+                break;
+            case "DELETE":
+                curl.setOpt(CurlOpt.CUSTOMREQUEST, "DELETE");
+                break;
+            case "PATCH":
+                curl.setOpt(CurlOpt.CUSTOMREQUEST, "PATCH");
+                break;
+            case "OPTIONS":
+                curl.setOpt(CurlOpt.CUSTOMREQUEST, "OPTIONS");
+                break;
+            default:
+                curl.setOpt(CurlOpt.CUSTOMREQUEST, method);
+        }
+    }
+    /**
+     * Build headers list for curl
+     */
+    buildHeaders(options, fingerprint) {
+        const headers = new Headers();
+        if (fingerprint && options.defaultHeaders !== false) {
+            for (const [name, value] of Object.entries(fingerprint.headers)) {
+                if (name.toLowerCase() === "host" && value === "") {
+                    continue;
+                }
+                headers.set(name, value);
+            }
+        }
+        // Add session headers first
+        for (const [name, value] of this._headers) {
+            headers.append(name, value);
+        }
+        // Add request headers (override session headers)
+        if (options.headers) {
+            const reqHeaders = new Headers(options.headers);
+            for (const [name, value] of reqHeaders) {
+                headers.set(name, value);
+            }
+        }
+        // Add User-Agent if not set
+        if (!headers.has("user-agent") && options.userAgent) {
+            headers.set("User-Agent", options.userAgent);
+        }
+        // Add Accept-Encoding if not set
+        if (!headers.has("accept-encoding")) {
+            const encoding = options.acceptEncoding ?? "gzip, deflate, br";
+            if (encoding) {
+                headers.set("Accept-Encoding", encoding);
+            }
+        }
+        // Add Referer if specified
+        if (options.referer) {
+            headers.set("Referer", options.referer);
+        }
+        // Let libcurl generate the multipart Content-Type with its boundary.
+        if (this.hasMultipartBody(options)) {
+            headers.delete("content-type");
+        }
+        else if (options.json !== undefined && !headers.has("content-type")) {
+            headers.set("Content-Type", "application/json");
+        }
+        else if (options.data !== undefined && !headers.has("content-type")) {
+            headers.set("Content-Type", "application/x-www-form-urlencoded");
+        }
+        return headers.toCurlHeaders();
+    }
+    /**
+     * Build cookie header for request
+     */
+    buildCookieHeader(url, options) {
+        const cookies = new Cookies();
+        // Add session cookies matching the URL
+        const sessionCookies = this._cookies.getForUrl(url);
+        for (const cookie of sessionCookies) {
+            cookies.set(cookie.name, cookie.value, cookie);
+        }
+        // Add/override with request cookies
+        if (options.cookies) {
+            cookies.update(options.cookies);
+        }
+        const header = cookies.toCookieHeader();
+        return header || null;
+    }
+    /**
+     * Set request body
+     */
+    setBody(curl, method, options) {
+        if (options.readCallback) {
+            if (options.json !== undefined ||
+                options.data !== undefined ||
+                options.content !== undefined ||
+                this.hasMultipartBody(options)) {
+                throw new Error("readCallback cannot be combined with other request body options");
+            }
+            curl.setReadFunction(options.readCallback);
+            curl.setOpt(CurlOpt.UPLOAD, 1);
+            curl.setOpt(CurlOpt.CUSTOMREQUEST, method.toUpperCase());
+            if (options.readCallbackSize !== undefined) {
+                curl.setOpt(CurlOpt.INFILESIZE_LARGE, BigInt(options.readCallbackSize));
+            }
+            return null;
+        }
+        if (this.hasMultipartBody(options)) {
+            const mime = new CurlMime(curl);
+            this.addDataFieldsToMime(mime, options.data);
+            if (options.multipart) {
+                for (const field of options.multipart) {
+                    this.addMultipartField(mime, field);
+                }
+            }
+            if (options.files) {
+                for (const [name, file] of Object.entries(options.files)) {
+                    if (typeof file === "string") {
+                        this.addFilePathPart(mime, name, file);
+                    }
+                    else if (Buffer.isBuffer(file)) {
+                        mime.addPart({ name, data: file, filename: name });
+                    }
+                    else {
+                        mime.addPart({
+                            name,
+                            data: file.content,
+                            filename: file.filename,
+                            contentType: file.contentType,
+                        });
+                    }
+                }
+            }
+            mime.attach(curl);
+            return mime;
+        }
+        let body = null;
+        if (options.json !== undefined) {
+            body = Buffer.from(JSON.stringify(options.json), "utf-8");
+        }
+        else if (options.data !== undefined) {
+            if (typeof options.data === "string") {
+                body = Buffer.from(options.data, "utf-8");
+            }
+            else if (options.data instanceof URLSearchParams) {
+                body = Buffer.from(options.data.toString(), "utf-8");
+            }
+            else {
+                // Convert object to URL-encoded form
+                const params = new URLSearchParams();
+                for (const [key, value] of Object.entries(options.data)) {
+                    params.append(key, String(value));
+                }
+                body = Buffer.from(params.toString(), "utf-8");
+            }
+        }
+        else if (options.content !== undefined) {
+            body = Buffer.isBuffer(options.content)
+                ? options.content
+                : Buffer.from(options.content, "utf-8");
+        }
+        if (body !== null) {
+            curl.setOpt(CurlOpt.POSTFIELDS, body);
+            curl.setOpt(CurlOpt.POSTFIELDSIZE, body.length);
+        }
+        else if (method.toUpperCase() === "POST") {
+            curl.setOpt(CurlOpt.POSTFIELDS, "");
+            curl.setOpt(CurlOpt.POSTFIELDSIZE, 0);
+        }
+        return null;
+    }
+    hasMultipartBody(options) {
+        return options.multipart !== undefined || options.files !== undefined;
+    }
+    addDataFieldsToMime(mime, data) {
+        if (data === undefined) {
+            return;
+        }
+        if (typeof data === "string") {
+            throw new Error("String data cannot be combined with multipart/files");
+        }
+        if (data instanceof URLSearchParams) {
+            data.forEach((value, name) => {
+                mime.addPart({ name, data: value });
+            });
+            return;
+        }
+        for (const [name, value] of Object.entries(data)) {
+            mime.addPart({ name, data: String(value) });
+        }
+    }
+    addMultipartField(mime, field) {
+        if (field.filepath) {
+            this.addFilePathPart(mime, field.name, field.filepath, field.filename, field.contentType);
+            return;
+        }
+        mime.addPart({
+            name: field.name,
+            data: field.value,
+            filename: field.filename,
+            contentType: field.contentType,
+        });
+    }
+    addFilePathPart(mime, name, filepath, filename, contentType) {
+        mime.addPart({
+            name,
+            filepath,
+            filename,
+            contentType,
+        });
+    }
+    /**
+     * Set authentication
+     */
+    setAuth(curl, options) {
+        if (!options.auth)
+            return;
+        if (typeof options.auth === "string") {
+            // "username:password" format
+            curl.setOpt(CurlOpt.USERPWD, options.auth);
+        }
+        else if ("token" in options.auth) {
+            // Bearer token
+            const bearer = options.auth;
+            curl.setOpt(CurlOpt.XOAUTH2_BEARER, bearer.token);
+            curl.setOpt(CurlOpt.HTTPAUTH, CurlAuth.CURLAUTH_BEARER);
+        }
+        else if ("type" in options.auth && options.auth.type === "digest") {
+            // Digest auth
+            const digest = options.auth;
+            curl.setOpt(CurlOpt.USERPWD, `${digest.username}:${digest.password}`);
+            curl.setOpt(CurlOpt.HTTPAUTH, CurlAuth.CURLAUTH_DIGEST);
+        }
+        else {
+            // Basic auth (default)
+            const basic = options.auth;
+            curl.setOpt(CurlOpt.USERPWD, `${basic.username}:${basic.password}`);
+            curl.setOpt(CurlOpt.HTTPAUTH, CurlAuth.CURLAUTH_BASIC);
+        }
+    }
+    /**
+     * Set proxy configuration
+     */
+    setProxy(curl, options) {
+        const proxy = options.proxy || options.proxies?.all || options.proxies?.https || options.proxies?.http;
+        if (proxy) {
+            curl.setOpt(CurlOpt.PROXY, proxy);
+        }
+        if (options.proxyAuth) {
+            curl.setOpt(CurlOpt.PROXYUSERPWD, `${options.proxyAuth.username}:${options.proxyAuth.password}`);
+        }
+    }
+    /**
+     * Set SSL/TLS options
+     */
+    setSslOptions(curl, options) {
+        // SSL verification
+        if (options.verify === false) {
+            curl.setOpt(CurlOpt.SSL_VERIFYPEER, 0);
+            curl.setOpt(CurlOpt.SSL_VERIFYHOST, 0);
+        }
+        else {
+            curl.setOpt(CurlOpt.SSL_VERIFYPEER, 1);
+            curl.setOpt(CurlOpt.SSL_VERIFYHOST, 2);
+            if (process.platform === "win32" && !options.caCert) {
+                try {
+                    curl.setOpt(CurlOpt.SSL_OPTIONS, CurlSslOpt.CURLSSLOPT_NATIVE_CA);
+                    curl.setOpt(CurlOpt.PROXY_SSL_OPTIONS, CurlSslOpt.CURLSSLOPT_NATIVE_CA);
+                }
+                catch {
+                    // Some libcurl/SSL backend combinations cannot use the Windows CA store.
+                    // Users can still pass caCert to provide an explicit bundle.
+                }
+            }
+        }
+        // CA certificate
+        if (options.caCert) {
+            curl.setOpt(CurlOpt.CAINFO, options.caCert);
+        }
+        // Client certificate
+        if (options.cert) {
+            if (typeof options.cert === "string") {
+                curl.setOpt(CurlOpt.SSLCERT, options.cert);
+            }
+            else {
+                const certConfig = options.cert;
+                curl.setOpt(CurlOpt.SSLCERT, certConfig.cert);
+                if (certConfig.key) {
+                    curl.setOpt(CurlOpt.SSLKEY, certConfig.key);
+                }
+                if (certConfig.password) {
+                    curl.setOpt(CurlOpt.KEYPASSWD, certConfig.password);
+                }
+            }
+        }
+    }
+    /**
+     * Set timeouts
+     */
+    setTimeouts(curl, options) {
+        if (options.timeout !== undefined) {
+            // Convert seconds to milliseconds
+            curl.setOpt(CurlOpt.TIMEOUT_MS, Math.floor(options.timeout * 1000));
+        }
+        if (options.connectTimeout !== undefined) {
+            curl.setOpt(CurlOpt.CONNECTTIMEOUT_MS, Math.floor(options.connectTimeout * 1000));
+        }
+    }
+    /**
+     * Set redirect behavior
+     */
+    setRedirects(curl, options) {
+        const allowRedirects = options.allowRedirects !== false;
+        curl.setOpt(CurlOpt.FOLLOWLOCATION, allowRedirects ? 1 : 0);
+        if (allowRedirects) {
+            const maxRedirects = options.maxRedirects ?? 30;
+            curl.setOpt(CurlOpt.MAXREDIRS, maxRedirects);
+        }
+    }
+    /**
+     * Set HTTP version
+     */
+    setHttpVersion(curl, options) {
+        if (!options.httpVersion)
+            return;
+        switch (options.httpVersion) {
+            case "1.0":
+                curl.setOpt(CurlOpt.HTTP_VERSION, CurlHttpVersion.CURL_HTTP_VERSION_1_0);
+                break;
+            case "1.1":
+                curl.setOpt(CurlOpt.HTTP_VERSION, CurlHttpVersion.CURL_HTTP_VERSION_1_1);
+                break;
+            case "2":
+                curl.setOpt(CurlOpt.HTTP_VERSION, CurlHttpVersion.CURL_HTTP_VERSION_2_0);
+                break;
+            case "3":
+                curl.setOpt(CurlOpt.HTTP_VERSION, CurlHttpVersion.CURL_HTTP_VERSION_3);
+                break;
+        }
+    }
+    /**
+     * Set network interface options
+     */
+    setInterface(curl, options) {
+        if (options.interface) {
+            curl.setOpt(CurlOpt.INTERFACE, options.interface);
+        }
+        if (options.localAddress) {
+            curl.setOpt(CurlOpt.INTERFACE, options.localAddress);
+        }
+        if (options.localPort) {
+            curl.setOpt(CurlOpt.LOCALPORT, options.localPort);
+        }
+    }
+    /**
+     * Set DNS options
+     */
+    setDnsOptions(curl, options) {
+        if (options.dnsServers && options.dnsServers.length > 0) {
+            curl.setOpt(CurlOpt.DNS_SERVERS, options.dnsServers.join(","));
+        }
+        if (options.dohUrl) {
+            curl.setOpt(CurlOpt.DOH_URL, options.dohUrl);
+        }
+    }
+    /**
+     * Set browser impersonation and fingerprinting options
+     */
+    setImpersonation(curl, options, fingerprint) {
+        if (fingerprint) {
+            applyFingerprintOptions(curl, fingerprint, options.defaultHeaders !== false);
+        }
+        else if (typeof options.impersonate === "string") {
+            const target = resolveNativeImpersonateTarget(options.impersonate);
+            if (!target) {
+                throw new ImpersonateError(`Impersonating ${options.impersonate} is not supported`);
+            }
+            try {
+                curl.impersonate(target, options.defaultHeaders !== false);
+            }
+            catch (error) {
+                throw new ImpersonateError(`Impersonating ${target} is not supported`, error instanceof Error ? error : undefined);
+            }
+        }
+        // Apply extra fingerprint options (can complement impersonate or work standalone)
+        if (options.extraFp) {
+            setExtraFingerprintOptions(curl, options.extraFp);
+        }
+        // Apply JA3 TLS fingerprint
+        // Note: If impersonate was already applied, JA3 will override TLS settings
+        if (options.ja3) {
+            setJa3Options(curl, options.ja3);
+        }
+        // Apply Akamai HTTP/2 fingerprint
+        // Note: If impersonate was already applied, Akamai will override HTTP/2 settings
+        if (options.akamai) {
+            setAkamaiOptions(curl, options.akamai);
+        }
+    }
+    resolveFingerprint(impersonate) {
+        if (!impersonate) {
+            return null;
+        }
+        if (impersonate instanceof Fingerprint) {
+            return impersonate;
+        }
+        if (resolveNativeImpersonateTarget(impersonate)) {
+            return null;
+        }
+        try {
+            return FingerprintManager.getFingerprint(impersonate);
+        }
+        catch (error) {
+            throw new ImpersonateError(`Impersonating ${impersonate} is not supported`, error instanceof Error ? error : undefined);
+        }
+    }
+}
+//# sourceMappingURL=session.js.map

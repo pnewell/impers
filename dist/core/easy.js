@@ -1,0 +1,367 @@
+import { curl_easy_init, curl_easy_cleanup, curl_easy_perform, curl_easy_duphandle, curl_easy_reset, curl_easy_setopt_long, curl_easy_setopt_string, curl_easy_setopt_ptr, curl_easy_setopt_int64, curl_easy_getinfo_long, curl_easy_getinfo_double, curl_easy_getinfo_string, curl_easy_getinfo_slist, curl_easy_getinfo_off_t, curl_easy_impersonate, curl_version, curl_version_info, hasImpersonateSupport, koffi, } from "../ffi/libcurl.js";
+import { CurlOpt, CurlInfo, CurlCode, CurlVersion } from "../ffi/constants.js";
+import { raiseIfError } from "../utils/errors.js";
+import { wrapReadCallback, wrapWriteCallback, } from "../utils/callbacks.js";
+import { SList } from "./slist.js";
+import { setAkamaiOptions, setExtraFingerprintOptions, setJa3Options, } from "../utils/fingerprint.js";
+// Info type masks for determining which getinfo variant to use
+const CURLINFO_TYPEMASK = 0xf00000;
+const CURLINFO_STRING = 0x100000;
+const CURLINFO_LONG = 0x200000;
+const CURLINFO_DOUBLE = 0x300000;
+const CURLINFO_SLIST = 0x400000;
+const CURLINFO_OFF_T = 0x600000;
+/**
+ * Curl - Low-level wrapper around libcurl easy interface
+ *
+ * Provides direct access to curl_easy_* functions with proper
+ * memory management for callbacks and string lists.
+ */
+export class Curl {
+    handle;
+    _callbacks;
+    _slists;
+    _buffers;
+    constructor(options = {}) {
+        if (options.fromHandle) {
+            this.handle = options.fromHandle;
+        }
+        else {
+            this.handle = curl_easy_init();
+            if (!this.handle) {
+                throw new Error("curl_easy_init failed");
+            }
+        }
+        this._callbacks = [];
+        this._slists = [];
+        this._buffers = [];
+    }
+    /**
+     * Release JS-side resources tied to the easy handle.
+     * Registered Koffi callbacks must be explicitly unregistered or they keep
+     * the process alive even after the curl handle is cleaned up.
+     */
+    releaseResources() {
+        this._slists.forEach((list) => list.free());
+        this._slists = [];
+        for (const callback of this._callbacks) {
+            try {
+                koffi.unregister(callback);
+            }
+            catch {
+                // Ignore callbacks that are already released or were never registered.
+            }
+        }
+        this._callbacks = [];
+        this._buffers = [];
+    }
+    /**
+     * Get the underlying curl handle (for use with CurlMulti)
+     */
+    getHandle() {
+        return this.handle;
+    }
+    /**
+     * Set a curl option
+     * Automatically selects the correct setopt variant based on value type
+     */
+    setOpt(option, value) {
+        if (value === undefined || value === null) {
+            return;
+        }
+        if (!this.handle) {
+            throw new Error("Curl handle is null");
+        }
+        let code;
+        if (typeof value === "string") {
+            code = curl_easy_setopt_string(this.handle, option, value);
+        }
+        else if (typeof value === "number") {
+            code = curl_easy_setopt_long(this.handle, option, value);
+        }
+        else if (typeof value === "boolean") {
+            code = curl_easy_setopt_long(this.handle, option, value ? 1 : 0);
+        }
+        else if (typeof value === "bigint") {
+            code = curl_easy_setopt_int64(this.handle, option, value);
+        }
+        else if (Buffer.isBuffer(value)) {
+            // Keep reference to prevent GC
+            this._buffers.push(value);
+            code = curl_easy_setopt_ptr(this.handle, option, value);
+        }
+        else {
+            code = curl_easy_setopt_ptr(this.handle, option, value);
+        }
+        raiseIfError(code);
+    }
+    /**
+     * Get info from a completed transfer
+     * Automatically selects the correct getinfo variant based on info type
+     */
+    getInfo(info) {
+        if (!this.handle) {
+            throw new Error("Curl handle is null");
+        }
+        const infoType = info & CURLINFO_TYPEMASK;
+        switch (infoType) {
+            case CURLINFO_STRING: {
+                const { code, value } = curl_easy_getinfo_string(this.handle, info);
+                raiseIfError(code);
+                return value;
+            }
+            case CURLINFO_LONG: {
+                const { code, value } = curl_easy_getinfo_long(this.handle, info);
+                raiseIfError(code);
+                return value;
+            }
+            case CURLINFO_DOUBLE: {
+                const { code, value } = curl_easy_getinfo_double(this.handle, info);
+                raiseIfError(code);
+                return value;
+            }
+            case CURLINFO_SLIST: {
+                const { code, value } = curl_easy_getinfo_slist(this.handle, info);
+                raiseIfError(code);
+                // TODO: Convert slist to string array
+                return value;
+            }
+            case CURLINFO_OFF_T: {
+                const { code, value } = curl_easy_getinfo_off_t(this.handle, info);
+                raiseIfError(code);
+                return value;
+            }
+            default:
+                throw new Error(`Unknown CURLINFO type: 0x${infoType.toString(16)}`);
+        }
+    }
+    /**
+     * Get response status code
+     */
+    getResponseCode() {
+        return this.getInfo(CurlInfo.RESPONSE_CODE);
+    }
+    /**
+     * Get effective URL (after redirects)
+     */
+    getEffectiveUrl() {
+        return this.getInfo(CurlInfo.EFFECTIVE_URL);
+    }
+    /**
+     * Get content type from response
+     */
+    getContentType() {
+        return this.getInfo(CurlInfo.CONTENT_TYPE);
+    }
+    /**
+     * Get total transfer time in seconds
+     */
+    getTotalTime() {
+        return this.getInfo(CurlInfo.TOTAL_TIME);
+    }
+    /**
+     * Get primary IP address
+     */
+    getPrimaryIp() {
+        return this.getInfo(CurlInfo.PRIMARY_IP);
+    }
+    /**
+     * Get primary port
+     */
+    getPrimaryPort() {
+        return this.getInfo(CurlInfo.PRIMARY_PORT);
+    }
+    /**
+     * Get local IP address
+     */
+    getLocalIp() {
+        return this.getInfo(CurlInfo.LOCAL_IP);
+    }
+    /**
+     * Get local port
+     */
+    getLocalPort() {
+        return this.getInfo(CurlInfo.LOCAL_PORT);
+    }
+    /**
+     * Get redirect count
+     */
+    getRedirectCount() {
+        return this.getInfo(CurlInfo.REDIRECT_COUNT);
+    }
+    /**
+     * Get redirect URL (if any)
+     */
+    getRedirectUrl() {
+        return this.getInfo(CurlInfo.REDIRECT_URL);
+    }
+    /**
+     * Get HTTP version used
+     */
+    getHttpVersion() {
+        return this.getInfo(CurlInfo.HTTP_VERSION);
+    }
+    /**
+     * Set write callback function
+     */
+    setWriteFunction(fn) {
+        const cb = wrapWriteCallback(fn);
+        this._callbacks.push(cb);
+        this.setOpt(CurlOpt.WRITEFUNCTION, cb);
+    }
+    /**
+     * Set header callback function
+     */
+    setHeaderFunction(fn) {
+        const cb = wrapWriteCallback(fn);
+        this._callbacks.push(cb);
+        this.setOpt(CurlOpt.HEADERFUNCTION, cb);
+    }
+    /**
+     * Set read callback function
+     */
+    setReadFunction(fn) {
+        const cb = wrapReadCallback(fn);
+        this._callbacks.push(cb);
+        this.setOpt(CurlOpt.READFUNCTION, cb);
+    }
+    /**
+     * Set a curl_slist option from an array of strings.
+     */
+    setStringList(option, values) {
+        if (!values || !values.length) {
+            return;
+        }
+        const list = new SList();
+        values.forEach((value) => list.append(value));
+        this._slists.push(list);
+        this.setOpt(option, list.pointer);
+    }
+    /**
+     * Set HTTP headers from array of "Header: Value" strings
+     */
+    setHeaders(headers) {
+        if (!headers || !headers.length) {
+            return;
+        }
+        this.setStringList(CurlOpt.HTTPHEADER, headers);
+    }
+    /**
+     * Enable browser impersonation (requires curl-impersonate)
+     * @param target Browser target (e.g., "chrome124", "firefox120", "safari17_0")
+     * @param defaultHeaders Whether to add default browser headers (default: true)
+     */
+    impersonate(target, defaultHeaders = true) {
+        if (!curl_easy_impersonate) {
+            throw new Error("Browser impersonation not available. " +
+                "Make sure you're using libcurl-impersonate instead of standard libcurl.");
+        }
+        if (!this.handle) {
+            throw new Error("Curl handle is null");
+        }
+        const code = curl_easy_impersonate(this.handle, target, defaultHeaders ? 1 : 0);
+        raiseIfError(code);
+    }
+    /**
+     * Check if impersonation is available
+     */
+    static hasImpersonateSupport() {
+        return hasImpersonateSupport();
+    }
+    /**
+     * Perform the request synchronously
+     */
+    perform() {
+        if (!this.handle) {
+            throw new Error("Curl handle is null");
+        }
+        raiseIfError(curl_easy_perform(this.handle));
+    }
+    /**
+     * Reset the handle to initial state for reuse
+     * Clears all options but keeps connections alive
+     */
+    reset() {
+        if (!this.handle) {
+            throw new Error("Curl handle is null");
+        }
+        this.releaseResources();
+        curl_easy_reset(this.handle);
+    }
+    /**
+     * Duplicate this curl handle
+     * Returns a new Curl instance with the same options
+     */
+    dupHandle() {
+        if (!this.handle) {
+            throw new Error("Curl handle is null");
+        }
+        const newHandle = curl_easy_duphandle(this.handle);
+        if (!newHandle) {
+            throw new Error("curl_easy_duphandle failed");
+        }
+        return new Curl({ fromHandle: newHandle });
+    }
+    /**
+     * Apply JA3 TLS fingerprint
+     *
+     * JA3 format: tls_version,ciphers,extensions,curves,curve_formats
+     * Example: 771,4865-4866-4867-49195-49199,0-23-65281-10-11-35-16-5-13-18-51-45-43-27-17513,29-23-24,0
+     *
+     * Requires curl-impersonate for full extension control.
+     *
+     * @param ja3 - JA3 fingerprint string
+     * @param permute - If true, don't enforce extension order (allows random permutation)
+     */
+    setJa3(ja3, permute = false) {
+        setJa3Options(this, ja3, permute);
+    }
+    /**
+     * Apply Akamai HTTP/2 fingerprint
+     *
+     * Akamai format: settings|window_update|streams|header_order
+     * Example: 1:65536;3:1000;4:6291456;6:262144|15663105|0|m,a,s,p
+     *
+     * Requires curl-impersonate.
+     *
+     * @param akamai - Akamai fingerprint string
+     */
+    setAkamai(akamai) {
+        setAkamaiOptions(this, akamai);
+    }
+    /**
+     * Apply extra fingerprint options for fine-grained TLS/HTTP2 control
+     *
+     * Requires curl-impersonate.
+     *
+     * @param options - Extra fingerprint configuration
+     */
+    setExtraFingerprint(options) {
+        setExtraFingerprintOptions(this, options);
+    }
+    /**
+     * Cleanup and release resources
+     */
+    cleanup() {
+        this.releaseResources();
+        if (this.handle) {
+            curl_easy_cleanup(this.handle);
+            this.handle = null;
+        }
+    }
+    /**
+     * Get libcurl version string
+     */
+    static version() {
+        return curl_version() || "unknown";
+    }
+    /**
+     * Get detailed version information
+     */
+    static versionInfo() {
+        return curl_version_info(CurlVersion.CURLVERSION_NOW);
+    }
+}
+// Re-export for convenience
+export { CurlOpt, CurlInfo, CurlCode };
+//# sourceMappingURL=easy.js.map

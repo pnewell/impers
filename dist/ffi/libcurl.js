@@ -1,0 +1,362 @@
+import koffi from "koffi";
+import { resolveLibcurlPath } from "../utils/platform.js";
+const libraryPath = await resolveLibcurlPath();
+const lib = koffi.load(libraryPath);
+let asyncLibraryPinned = false;
+const koffiTypeSuffix = `${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+// Pointer types for koffi
+const CURL = koffi.pointer("void");
+const CURLM = koffi.pointer("void");
+const curl_slist_ptr = koffi.pointer("void");
+const curl_mime_ptr = koffi.pointer("void");
+const curl_mimepart_ptr = koffi.pointer("void");
+// Struct for curl_multi_info_read result
+// Note: On 64-bit systems, there is padding after msg to align easy_handle
+// The data union contains both void* and CURLcode - we use void* for correct alignment
+const CURLMsg = koffi.struct(`CURLMsg_${koffiTypeSuffix}`, {
+    msg: "int",
+    _pad: "int", // 4 bytes padding for 64-bit alignment
+    easy_handle: "void *", // 8 bytes
+    data: "void *", // Union as void* for proper 64-bit alignment (result is in low 4 bytes)
+});
+// WebSocket frame metadata struct
+const curl_ws_frame = koffi.struct(`curl_ws_frame_${koffiTypeSuffix}`, {
+    age: "int",
+    flags: "int",
+    offset: "int64",
+    bytesleft: "int64",
+    len: "size_t",
+});
+// ============================================================================
+// Easy Interface Functions
+// ============================================================================
+const curl_easy_init = lib.func("void * curl_easy_init()");
+const curl_easy_cleanup = lib.func("void curl_easy_cleanup(void *)");
+const curl_easy_perform = lib.func("int curl_easy_perform(void *)");
+/**
+ * Async version of curl_easy_perform that runs in a worker thread
+ * via Koffi's .async() support. This avoids blocking the event loop,
+ * which is critical when the mock server runs in the same process.
+ */
+function curl_easy_perform_async(handle) {
+    if (process.platform === "darwin" && !asyncLibraryPinned) {
+        // Koffi can unload libcurl before libuv's workers exit. BoringSSL registers
+        // thread-local destructors on those workers, so their code must remain
+        // mapped until process exit. These flags come from macOS <dlfcn.h>.
+        const system = koffi.load("/usr/lib/libSystem.B.dylib");
+        const dlopen = system.func("void *dlopen(const char *, int)");
+        const dlclose = system.func("int dlclose(void *)");
+        const RTLD_NOW = 0x2;
+        const RTLD_LOCAL = 0x4;
+        const RTLD_NODELETE = 0x80;
+        const pinned = dlopen(libraryPath, RTLD_NOW | RTLD_LOCAL | RTLD_NODELETE);
+        if (!pinned) {
+            return Promise.reject(new Error("Failed to keep libcurl loaded for asynchronous transfers"));
+        }
+        dlclose(pinned);
+        asyncLibraryPinned = true;
+    }
+    return new Promise((resolve, reject) => {
+        curl_easy_perform
+            .async(handle, (err, code) => {
+            if (err)
+                reject(err);
+            else
+                resolve(code);
+        });
+    });
+}
+const curl_easy_duphandle = lib.func("void * curl_easy_duphandle(void *)");
+const curl_easy_reset = lib.func("void curl_easy_reset(void *)");
+const curl_easy_strerror = lib.func("const char * curl_easy_strerror(int)");
+// curl_easy_setopt is variadic - we need wrapper functions
+const curl_easy_setopt_variadic = lib.func("int curl_easy_setopt(void *, int, ...)");
+function curl_easy_setopt_long(handle, option, value) {
+    return curl_easy_setopt_variadic(handle, option, "long", value);
+}
+function curl_easy_setopt_string(handle, option, value) {
+    return curl_easy_setopt_variadic(handle, option, "str", value);
+}
+function curl_easy_setopt_ptr(handle, option, value) {
+    return curl_easy_setopt_variadic(handle, option, "void *", value);
+}
+function curl_easy_setopt_int64(handle, option, value) {
+    return curl_easy_setopt_variadic(handle, option, "int64", value);
+}
+function curl_easy_setopt_blob(handle, option, data, flags) {
+    // Create a curl_blob struct inline
+    const blob = { data, len: data.length, flags };
+    return curl_easy_setopt_variadic(handle, option, "void *", blob);
+}
+// curl_easy_getinfo is also variadic
+const curl_easy_getinfo_variadic = lib.func("int curl_easy_getinfo(void *, int, ...)");
+function curl_easy_getinfo_long(handle, info) {
+    const out = [0];
+    const code = curl_easy_getinfo_variadic(handle, info, koffi.out("long *"), out);
+    return { code, value: out[0] };
+}
+function curl_easy_getinfo_double(handle, info) {
+    const out = new Float64Array(1);
+    const code = curl_easy_getinfo_variadic(handle, info, "double *", out);
+    return { code, value: out[0] };
+}
+function curl_easy_getinfo_string(handle, info) {
+    const out = [null];
+    const code = curl_easy_getinfo_variadic(handle, info, koffi.out("char **"), out);
+    return { code, value: out[0] };
+}
+function curl_easy_getinfo_slist(handle, info) {
+    const out = [null];
+    const code = curl_easy_getinfo_variadic(handle, info, koffi.out("void **"), out);
+    return { code, value: out[0] };
+}
+function curl_easy_getinfo_off_t(handle, info) {
+    const out = new BigInt64Array(1);
+    const code = curl_easy_getinfo_variadic(handle, info, "int64 *", out);
+    return { code, value: out[0] };
+}
+function curl_easy_getinfo_socket(handle, info) {
+    const out = new Int32Array(1);
+    const code = curl_easy_getinfo_variadic(handle, info, "int *", out);
+    return { code, value: out[0] };
+}
+function curl_easy_getinfo_ptr(handle, info) {
+    const out = [null];
+    const code = curl_easy_getinfo_variadic(handle, info, koffi.out("void **"), out);
+    return { code, value: out[0] };
+}
+// ============================================================================
+// Version Functions
+// ============================================================================
+const curl_version = lib.func("const char * curl_version()");
+// curl_version_info returns a pointer to a static struct
+// We define a simplified version info struct for reading
+const curl_version_info_data = koffi.struct(`curl_version_info_data_${koffiTypeSuffix}`, {
+    age: "int",
+    version: "const char *",
+    version_num: "uint32",
+    host: "const char *",
+    features: "int",
+    ssl_version: "const char *",
+    ssl_version_num: "long", // deprecated
+    libz_version: "const char *",
+    protocols: "const char **",
+    ares: "const char *",
+    ares_num: "int",
+    libidn: "const char *",
+    iconv_ver_num: "int",
+    libssh_version: "const char *",
+    brotli_ver_num: "uint32",
+    brotli_version: "const char *",
+    nghttp2_ver_num: "uint32",
+    nghttp2_version: "const char *",
+    quic_version: "const char *",
+    cainfo: "const char *",
+    capath: "const char *",
+    zstd_ver_num: "uint32",
+    zstd_version: "const char *",
+    hyper_version: "const char *",
+    gsasl_version: "const char *",
+    feature_names: "const char **",
+});
+const curl_version_info_fn = lib.func("void * curl_version_info(int)");
+function curl_version_info(age) {
+    const ptr = curl_version_info_fn(age);
+    if (!ptr)
+        return null;
+    return koffi.decode(ptr, curl_version_info_data);
+}
+// ============================================================================
+// SList Functions
+// ============================================================================
+const curl_slist_append = lib.func("void * curl_slist_append(void *, const char *)");
+const curl_slist_free_all = lib.func("void curl_slist_free_all(void *)");
+// ============================================================================
+// Multi Interface Functions
+// ============================================================================
+const curl_multi_init = lib.func("void * curl_multi_init()");
+const curl_multi_cleanup = lib.func("int curl_multi_cleanup(void *)");
+const curl_multi_add_handle = lib.func("int curl_multi_add_handle(void *, void *)");
+const curl_multi_remove_handle = lib.func("int curl_multi_remove_handle(void *, void *)");
+const curl_multi_strerror = lib.func("const char * curl_multi_strerror(int)");
+const curl_multi_wakeup = lib.func("int curl_multi_wakeup(void *)");
+// curl_multi_socket_action(CURLM *multi, curl_socket_t s, int ev_bitmask, int *running_handles)
+const curl_multi_socket_action_fn = lib.func("int curl_multi_socket_action(void *, int, int, int *)");
+function curl_multi_socket_action(multi, socket, evBitmask) {
+    const running = new Int32Array(1);
+    const code = curl_multi_socket_action_fn(multi, socket, evBitmask, running);
+    return { code, runningHandles: running[0] };
+}
+// curl_multi_perform(CURLM *multi, int *running_handles)
+const curl_multi_perform_fn = lib.func("int curl_multi_perform(void *, int *)");
+function curl_multi_perform(multi) {
+    const running = new Int32Array(1);
+    const code = curl_multi_perform_fn(multi, running);
+    return { code, runningHandles: running[0] };
+}
+// curl_multi_poll(CURLM *multi, struct curl_waitfd extra_fds[], unsigned int extra_nfds, int timeout_ms, int *numfds)
+const curl_multi_poll_fn = lib.func("int curl_multi_poll(void *, void *, uint32, int, int *)");
+function curl_multi_poll(multi, timeoutMs) {
+    const numfds = new Int32Array(1);
+    const code = curl_multi_poll_fn(multi, null, 0, timeoutMs, numfds);
+    return { code, numfds: numfds[0] };
+}
+// curl_multi_timeout(CURLM *multi, long *timeout)
+const curl_multi_timeout_fn = lib.func("int curl_multi_timeout(void *, _Out_ long *)");
+function curl_multi_timeout(multi) {
+    const timeout = [0];
+    const code = curl_multi_timeout_fn(multi, timeout);
+    return { code, timeoutMs: timeout[0] };
+}
+// curl_multi_info_read(CURLM *multi, int *msgs_in_queue) -> CURLMsg*
+const curl_multi_info_read_fn = lib.func("void * curl_multi_info_read(void *, int *)");
+function curl_multi_info_read(multi) {
+    const msgsInQueue = new Int32Array(1);
+    const msgPtr = curl_multi_info_read_fn(multi, msgsInQueue);
+    if (!msgPtr) {
+        return { message: null, msgsInQueue: msgsInQueue[0] };
+    }
+    // Decode the raw bytes to get the result as an integer
+    // CURLMsg layout: int msg (4) + int pad (4) + void* easy_handle (8) + union data (8)
+    const rawBytes = koffi.decode(msgPtr, koffi.array("uint8", 24));
+    const buffer = Buffer.from(rawBytes);
+    const msgType = buffer.readInt32LE(0);
+    const result = buffer.readInt32LE(16); // Result is at offset 16 (first 4 bytes of union)
+    // Decode the struct to get the easy_handle pointer
+    const msg = koffi.decode(msgPtr, CURLMsg);
+    return {
+        message: {
+            msg: msgType,
+            easyHandle: msg.easy_handle,
+            result: result,
+        },
+        msgsInQueue: msgsInQueue[0],
+    };
+}
+// curl_multi_setopt is variadic
+const curl_multi_setopt_variadic = lib.func("int curl_multi_setopt(void *, int, ...)");
+function curl_multi_setopt_long(multi, option, value) {
+    return curl_multi_setopt_variadic(multi, option, "long", value);
+}
+function curl_multi_setopt_ptr(multi, option, value) {
+    return curl_multi_setopt_variadic(multi, option, "void *", value);
+}
+function curl_multi_setopt_off_t(multi, option, value) {
+    return curl_multi_setopt_variadic(multi, option, "int64", value);
+}
+// ============================================================================
+// WebSocket Functions
+// ============================================================================
+// curl_ws_recv(CURL *curl, void *buffer, size_t buflen, size_t *recv, const struct curl_ws_frame **meta)
+const curl_ws_recv_fn = lib.func("int curl_ws_recv(void *, void *, size_t, size_t *, _Out_ void **)");
+function curl_ws_recv(handle, buffer) {
+    const recv = new BigUint64Array(1);
+    const metaPtr = [null];
+    const code = curl_ws_recv_fn(handle, buffer, buffer.length, recv, metaPtr);
+    let frame = null;
+    if (metaPtr[0]) {
+        const meta = koffi.decode(metaPtr[0], curl_ws_frame);
+        frame = {
+            flags: meta.flags,
+            offset: BigInt(meta.offset),
+            bytesleft: BigInt(meta.bytesleft),
+            len: Number(meta.len),
+        };
+    }
+    return { code, received: Number(recv[0]), frame };
+}
+// curl_ws_send(CURL *curl, const void *buffer, size_t buflen, size_t *sent, curl_off_t fragsize, unsigned int flags)
+const curl_ws_send_fn = lib.func("int curl_ws_send(void *, void *, size_t, size_t *, int64, uint32)");
+function curl_ws_send(handle, buffer, flags, fragsize = BigInt(0)) {
+    const sent = new BigUint64Array(1);
+    const code = curl_ws_send_fn(handle, buffer, buffer.length, sent, fragsize, flags);
+    return { code, sent: Number(sent[0]) };
+}
+// curl_ws_meta(CURL *curl) -> const struct curl_ws_frame*
+const curl_ws_meta_fn = lib.func("void * curl_ws_meta(void *)");
+function curl_ws_meta(handle) {
+    const metaPtr = curl_ws_meta_fn(handle);
+    if (!metaPtr) {
+        return null;
+    }
+    const meta = koffi.decode(metaPtr, curl_ws_frame);
+    return {
+        flags: meta.flags,
+        offset: BigInt(meta.offset),
+        bytesleft: BigInt(meta.bytesleft),
+        len: Number(meta.len),
+    };
+}
+// ============================================================================
+// MIME Functions
+// ============================================================================
+const curl_mime_init = lib.func("void * curl_mime_init(void *)");
+const curl_mime_free = lib.func("void curl_mime_free(void *)");
+const curl_mime_addpart = lib.func("void * curl_mime_addpart(void *)");
+const curl_mime_name = lib.func("int curl_mime_name(void *, const char *)");
+const curl_mime_filename = lib.func("int curl_mime_filename(void *, const char *)");
+const curl_mime_type = lib.func("int curl_mime_type(void *, const char *)");
+const curl_mime_data = lib.func("int curl_mime_data(void *, void *, size_t)");
+const curl_mime_filedata = lib.func("int curl_mime_filedata(void *, const char *)");
+const curl_mime_subparts = lib.func("int curl_mime_subparts(void *, void *)");
+const curl_mime_headers = lib.func("int curl_mime_headers(void *, void *, int)");
+const curl_mime_encoder = lib.func("int curl_mime_encoder(void *, const char *)");
+// ============================================================================
+// Impersonation Functions (curl-impersonate specific)
+// ============================================================================
+// These functions only exist in curl-impersonate, not standard libcurl
+// We try to load them but handle the case where they don't exist
+let curl_easy_impersonate = null;
+try {
+    const impersonate_fn = lib.func("int curl_easy_impersonate(void *, const char *, int)");
+    curl_easy_impersonate = (handle, target, defaultHeaders) => {
+        return impersonate_fn(handle, target, defaultHeaders);
+    };
+}
+catch {
+    // Function doesn't exist - using standard libcurl
+    curl_easy_impersonate = null;
+}
+function hasImpersonateSupport() {
+    return curl_easy_impersonate !== null;
+}
+// ============================================================================
+// Exports
+// ============================================================================
+export { koffi, 
+// Pointer types
+CURL, CURLM, curl_slist_ptr, curl_mime_ptr, curl_mimepart_ptr, 
+// Easy interface
+curl_easy_init, curl_easy_cleanup, curl_easy_perform, curl_easy_perform_async, curl_easy_duphandle, curl_easy_reset, curl_easy_strerror, curl_easy_setopt_long, curl_easy_setopt_string, curl_easy_setopt_ptr, curl_easy_setopt_int64, curl_easy_setopt_blob, curl_easy_getinfo_long, curl_easy_getinfo_double, curl_easy_getinfo_string, curl_easy_getinfo_slist, curl_easy_getinfo_off_t, curl_easy_getinfo_socket, curl_easy_getinfo_ptr, 
+// Version
+curl_version, curl_version_info, 
+// SList
+curl_slist_append, curl_slist_free_all, 
+// Multi interface
+curl_multi_init, curl_multi_cleanup, curl_multi_add_handle, curl_multi_remove_handle, curl_multi_perform, curl_multi_poll, curl_multi_socket_action, curl_multi_timeout, curl_multi_info_read, curl_multi_setopt_long, curl_multi_setopt_ptr, curl_multi_setopt_off_t, curl_multi_strerror, curl_multi_wakeup, 
+// WebSocket
+curl_ws_recv, curl_ws_send, curl_ws_meta, 
+// MIME
+curl_mime_init, curl_mime_free, curl_mime_addpart, curl_mime_name, curl_mime_filename, curl_mime_type, curl_mime_data, curl_mime_filedata, curl_mime_subparts, curl_mime_headers, curl_mime_encoder, 
+// Impersonation
+curl_easy_impersonate, hasImpersonateSupport, 
+// Utility
+getHandleAddress, };
+/**
+ * Get the address of a koffi External handle as a string.
+ * This allows comparing handles that point to the same memory.
+ */
+function getHandleAddress(handle) {
+    // koffi.address() returns the address as a BigInt
+    // We convert to hex string for use as a Map key
+    try {
+        const addr = koffi.address(handle);
+        return addr.toString(16);
+    }
+    catch {
+        // Fallback: try to extract from string representation
+        const match = String(handle).match(/External:\s*([0-9a-f]+)/i);
+        return match ? match[1] : String(handle);
+    }
+}
+//# sourceMappingURL=libcurl.js.map
