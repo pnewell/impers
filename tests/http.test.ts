@@ -6,6 +6,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Session } from "../src/http/session.js";
+import { CurlMulti } from "../src/core/multi.js";
 import { Headers } from "../src/http/headers.js";
 import { AbortError, get, post, put, del, patch } from "../src/public.js";
 import { Fingerprint, FingerprintManager } from "../src/fingerprints.js";
@@ -482,6 +483,42 @@ describe("Session", () => {
 
   describe("Errors", () => {
     it("should expose the libcurl code on mapped errors", async () => {
+      await expect(session.get("http://127.0.0.1:1/")).rejects.toMatchObject({
+        name: "ConnectionError",
+        curlCode: 7,
+      });
+    });
+  });
+
+  describe("Bun", () => {
+    const versions = process.versions as Record<string, string | undefined>;
+    const bunVersion = versions.bun;
+    const multiPerform = CurlMulti.prototype.perform;
+
+    beforeEach(() => {
+      versions.bun = bunVersion ?? "test";
+      CurlMulti.prototype.perform = () => Promise.reject(new Error("CurlMulti used"));
+    });
+
+    afterEach(() => {
+      if (bunVersion === undefined) {
+        delete versions.bun;
+      } else {
+        versions.bun = bunVersion;
+      }
+      CurlMulti.prototype.perform = multiPerform;
+    });
+
+    it("should perform requests without CurlMulti", async () => {
+      const resp = await session.post(`${globalThis.TEST_SERVER_URL}/post`, {
+        json: { runtime: "bun" },
+      });
+      expect(resp.statusCode).toBe(200);
+      const json = resp.json() as { json: { runtime: string } };
+      expect(json.json).toEqual({ runtime: "bun" });
+    });
+
+    it("should map libcurl errors", async () => {
       await expect(session.get("http://127.0.0.1:1/")).rejects.toMatchObject({
         name: "ConnectionError",
         curlCode: 7,
