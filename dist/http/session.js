@@ -3,14 +3,13 @@
  */
 import { Curl } from "../core/easy.js";
 import { CurlMulti, getSharedMulti } from "../core/multi.js";
-import { curl_easy_perform_async } from "../ffi/libcurl.js";
 import { CurlOpt, CurlHttpVersion, CurlAuth, CurlSslOpt } from "../ffi/constants.js";
 import { Headers } from "./headers.js";
 import { Cookies } from "./cookies.js";
 import { Response } from "./response.js";
 import { SList } from "../core/slist.js";
 import { CurlMime } from "../core/mime.js";
-import { AbortError, ImpersonateError, SessionClosed, raiseIfError, } from "../utils/errors.js";
+import { AbortError, ImpersonateError, SessionClosed, } from "../utils/errors.js";
 import { applyFingerprintOptions, setJa3Options, setAkamaiOptions, setExtraFingerprintOptions, } from "../utils/fingerprint.js";
 import { Fingerprint, FingerprintManager, resolveNativeImpersonateTarget, } from "../fingerprints.js";
 /**
@@ -213,14 +212,7 @@ export class Session {
             }
             const startTime = Date.now();
             try {
-                if (process.versions.bun) {
-                    // CurlMulti relies on libuv polling, which Bun does not implement
-                    // (oven-sh/bun#18546), so run each transfer on Koffi's thread pool.
-                    raiseIfError(await curl_easy_perform_async(curl.getHandle()));
-                }
-                else {
-                    await this.multi.perform(curl);
-                }
+                await this.multi.perform(curl);
             }
             catch (error) {
                 if (signal?.aborted) {

@@ -76,6 +76,11 @@ declare function curl_multi_poll(multi: CurlMultiHandle, timeoutMs: number): {
     code: number;
     numfds: number;
 };
+/**
+ * curl_multi_poll on a worker thread via Koffi's .async() support.
+ * Until it settles, only curl_multi_wakeup may be called on the handle.
+ */
+declare function curl_multi_poll_async(multi: CurlMultiHandle, timeoutMs: number): Promise<number>;
 declare function curl_multi_timeout(multi: CurlMultiHandle): {
     code: number;
     timeoutMs: number;
@@ -121,7 +126,7 @@ declare const curl_mime_headers: (...args: unknown[]) => unknown;
 declare const curl_mime_encoder: (...args: unknown[]) => unknown;
 declare let curl_easy_impersonate: ((handle: CurlHandle, target: string, defaultHeaders: number) => number) | null;
 declare function hasImpersonateSupport(): boolean;
-export { koffi, type CurlHandle, type CurlMultiHandle, type CurlSList, type CurlMime, type CurlMimePart, type WsFrame, type MultiInfoMessage, CURL, CURLM, curl_slist_ptr, curl_mime_ptr, curl_mimepart_ptr, curl_easy_init, curl_easy_cleanup, curl_easy_perform, curl_easy_perform_async, curl_easy_duphandle, curl_easy_reset, curl_easy_strerror, curl_easy_setopt_long, curl_easy_setopt_string, curl_easy_setopt_ptr, curl_easy_setopt_int64, curl_easy_setopt_blob, curl_easy_getinfo_long, curl_easy_getinfo_double, curl_easy_getinfo_string, curl_easy_getinfo_slist, curl_easy_getinfo_off_t, curl_easy_getinfo_socket, curl_easy_getinfo_ptr, curl_version, curl_version_info, curl_slist_append, curl_slist_free_all, curl_multi_init, curl_multi_cleanup, curl_multi_add_handle, curl_multi_remove_handle, curl_multi_perform, curl_multi_poll, curl_multi_socket_action, curl_multi_timeout, curl_multi_info_read, curl_multi_setopt_long, curl_multi_setopt_ptr, curl_multi_setopt_off_t, curl_multi_strerror, curl_multi_wakeup, curl_ws_recv, curl_ws_send, curl_ws_meta, curl_mime_init, curl_mime_free, curl_mime_addpart, curl_mime_name, curl_mime_filename, curl_mime_type, curl_mime_data, curl_mime_filedata, curl_mime_subparts, curl_mime_headers, curl_mime_encoder, curl_easy_impersonate, hasImpersonateSupport, getHandleAddress, };
+export { koffi, type CurlHandle, type CurlMultiHandle, type CurlSList, type CurlMime, type CurlMimePart, type WsFrame, type MultiInfoMessage, CURL, CURLM, curl_slist_ptr, curl_mime_ptr, curl_mimepart_ptr, curl_easy_init, curl_easy_cleanup, curl_easy_perform, curl_easy_perform_async, curl_easy_duphandle, curl_easy_reset, curl_easy_strerror, curl_easy_setopt_long, curl_easy_setopt_string, curl_easy_setopt_ptr, curl_easy_setopt_int64, curl_easy_setopt_blob, curl_easy_getinfo_long, curl_easy_getinfo_double, curl_easy_getinfo_string, curl_easy_getinfo_slist, curl_easy_getinfo_off_t, curl_easy_getinfo_socket, curl_easy_getinfo_ptr, curl_version, curl_version_info, curl_slist_append, curl_slist_free_all, curl_multi_init, curl_multi_cleanup, curl_multi_add_handle, curl_multi_remove_handle, curl_multi_perform, curl_multi_poll, curl_multi_poll_async, curl_multi_socket_action, curl_multi_timeout, curl_multi_info_read, curl_multi_setopt_long, curl_multi_setopt_ptr, curl_multi_setopt_off_t, curl_multi_strerror, curl_multi_wakeup, curl_ws_recv, curl_ws_send, curl_ws_meta, curl_mime_init, curl_mime_free, curl_mime_addpart, curl_mime_name, curl_mime_filename, curl_mime_type, curl_mime_data, curl_mime_filedata, curl_mime_subparts, curl_mime_headers, curl_mime_encoder, curl_easy_impersonate, hasImpersonateSupport, getHandleAddress, };
 /**
  * Get the address of a koffi External handle as a string.
  * This allows comparing handles that point to the same memory.

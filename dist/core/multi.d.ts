@@ -13,6 +13,13 @@ export interface TransferResult {
  *
  * Uses libcurl's socket action API to integrate with Node.js' event loop.
  * This allows multiple HTTP requests to run concurrently without blocking.
+ *
+ * Bun does not implement the libuv polling that koffi.node.poll needs
+ * (oven-sh/bun#18546). There, libcurl waits in curl_multi_poll on a worker
+ * thread instead, and transfers run on the main thread with curl_multi_perform.
+ * While that poll is in flight the handle belongs to the worker: only
+ * curl_multi_wakeup may be called, so adds and cancels are queued until the
+ * poll returns.
  */
 export declare class CurlMulti {
     private handle;
@@ -25,6 +32,12 @@ export declare class CurlMulti {
     private socketCallback;
     private timerCallback;
     private closed;
+    private readonly usePollThread;
+    private queuedAdds;
+    private queuedCancels;
+    private driver;
+    private driving;
+    private pollInFlight;
     constructor(options?: MultiOptions);
     private setOptLong;
     private setOptPtr;
@@ -34,6 +47,16 @@ export declare class CurlMulti {
      * Returns a Promise that resolves when the transfer completes
      */
     perform(curl: Curl): Promise<TransferResult>;
+    /**
+     * Start the curl_multi_poll loop, or wake it if it is waiting
+     */
+    private drive;
+    private runPollLoop;
+    /**
+     * Apply queued cancels and adds. Only called while no poll is in flight.
+     * Returns whether there are transfers left to drive.
+     */
+    private applyQueued;
     /**
      * Start the poll loop if not already running
      */

@@ -1,7 +1,8 @@
-import { curl_multi_init, curl_multi_cleanup, curl_multi_add_handle, curl_multi_remove_handle, curl_multi_socket_action, curl_multi_info_read, curl_multi_setopt_long, curl_multi_setopt_ptr, curl_multi_strerror, curl_easy_strerror, koffi, getHandleAddress, } from "../ffi/libcurl.js";
+import { curl_multi_init, curl_multi_cleanup, curl_multi_add_handle, curl_multi_remove_handle, curl_multi_socket_action, curl_multi_perform, curl_multi_poll_async, curl_multi_wakeup, curl_multi_info_read, curl_multi_setopt_long, curl_multi_setopt_ptr, curl_multi_strerror, curl_easy_strerror, koffi, getHandleAddress, } from "../ffi/libcurl.js";
 import { CurlMCode, CurlMOpt, CurlMsg, CurlCode, CurlPoll, CurlCSelect, CURL_SOCKET_TIMEOUT, } from "../ffi/constants.js";
 import { mapCurlError } from "../utils/errors.js";
 const SOCKET_ACTION_FALLBACK_MS = 100;
+const POLL_TIMEOUT_MS = 1000;
 const CURLPIPE_NOTHING = 0;
 const CURLPIPE_MULTIPLEX = 2;
 const koffiTypeSuffix = `${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2)}`;
@@ -17,6 +18,13 @@ function debugMulti(message) {
  *
  * Uses libcurl's socket action API to integrate with Node.js' event loop.
  * This allows multiple HTTP requests to run concurrently without blocking.
+ *
+ * Bun does not implement the libuv polling that koffi.node.poll needs
+ * (oven-sh/bun#18546). There, libcurl waits in curl_multi_poll on a worker
+ * thread instead, and transfers run on the main thread with curl_multi_perform.
+ * While that poll is in flight the handle belongs to the worker: only
+ * curl_multi_wakeup may be called, so adds and cancels are queued until the
+ * poll returns.
  */
 export class CurlMulti {
     handle;
@@ -29,6 +37,12 @@ export class CurlMulti {
     socketCallback = null;
     timerCallback = null;
     closed = false;
+    usePollThread = Boolean(process.versions.bun);
+    queuedAdds = [];
+    queuedCancels = new Map();
+    driver = null;
+    driving = false;
+    pollInFlight = false;
     constructor(options = {}) {
         this.handle = curl_multi_init();
         if (!this.handle) {
@@ -107,6 +121,14 @@ export class CurlMulti {
         if (!easyHandle) {
             throw new Error("Curl handle is null");
         }
+        if (this.usePollThread) {
+            return new Promise((resolve, reject) => {
+                const handleAddr = getHandleAddress(easyHandle);
+                this.queuedAdds.push({ curl, handle: easyHandle, handleAddr, resolve, reject });
+                this.curlToAddr.set(curl, handleAddr);
+                this.drive();
+            });
+        }
         return new Promise((resolve, reject) => {
             // Get the handle address for lookup
             const handleAddr = getHandleAddress(easyHandle);
@@ -125,6 +147,82 @@ export class CurlMulti {
             this.curlToAddr.set(curl, handleAddr);
             this.startPolling();
         });
+    }
+    /**
+     * Start the curl_multi_poll loop, or wake it if it is waiting
+     */
+    drive() {
+        if (this.driving) {
+            if (this.pollInFlight && this.handle) {
+                curl_multi_wakeup(this.handle);
+            }
+            return;
+        }
+        this.driving = true;
+        this.driver = this.runPollLoop();
+    }
+    async runPollLoop() {
+        try {
+            while (this.applyQueued()) {
+                const { code } = curl_multi_perform(this.handle);
+                if (code !== CurlMCode.CURLM_OK && code !== CurlMCode.CURLM_CALL_MULTI_PERFORM) {
+                    this.failAllPending(new Error(`curl_multi_perform failed: ${curl_multi_strerror(code)}`));
+                    break;
+                }
+                this.checkCompleted();
+                if (this.queuedAdds.length > 0 || this.queuedCancels.size > 0) {
+                    continue;
+                }
+                if (this.pendingTransfers.size === 0) {
+                    break;
+                }
+                this.pollInFlight = true;
+                let pollCode;
+                try {
+                    pollCode = await curl_multi_poll_async(this.handle, POLL_TIMEOUT_MS);
+                }
+                finally {
+                    this.pollInFlight = false;
+                }
+                if (pollCode !== CurlMCode.CURLM_OK) {
+                    this.failAllPending(new Error(`curl_multi_poll failed: ${curl_multi_strerror(pollCode)}`));
+                    break;
+                }
+            }
+        }
+        catch (error) {
+            this.failFromCallback("multi poll", error);
+        }
+        this.driving = false;
+    }
+    /**
+     * Apply queued cancels and adds. Only called while no poll is in flight.
+     * Returns whether there are transfers left to drive.
+     */
+    applyQueued() {
+        if (this.closed || !this.handle) {
+            return false;
+        }
+        for (const [handleAddr, error] of this.queuedCancels) {
+            const pending = this.pendingTransfers.get(handleAddr);
+            if (pending) {
+                curl_multi_remove_handle(this.handle, pending.handle);
+                this.pendingTransfers.delete(handleAddr);
+                this.curlToAddr.delete(pending.curl);
+                pending.reject(error);
+            }
+        }
+        this.queuedCancels.clear();
+        for (const transfer of this.queuedAdds.splice(0)) {
+            const code = curl_multi_add_handle(this.handle, transfer.handle);
+            if (code !== CurlMCode.CURLM_OK) {
+                this.curlToAddr.delete(transfer.curl);
+                transfer.reject(new Error(`curl_multi_add_handle failed: ${curl_multi_strerror(code)}`));
+                continue;
+            }
+            this.pendingTransfers.set(transfer.handleAddr, transfer);
+        }
+        return this.pendingTransfers.size > 0;
     }
     /**
      * Start the poll loop if not already running
@@ -323,6 +421,9 @@ export class CurlMulti {
      * Fail all pending transfers with an error
      */
     failAllPending(error) {
+        for (const queued of this.queuedAdds.splice(0)) {
+            queued.reject(error);
+        }
         for (const [, pending] of this.pendingTransfers) {
             if (this.handle) {
                 curl_multi_remove_handle(this.handle, pending.handle);
@@ -351,6 +452,21 @@ export class CurlMulti {
         const handleAddr = this.curlToAddr.get(curl);
         if (handleAddr === undefined)
             return false;
+        if (this.usePollThread) {
+            const queued = this.queuedAdds.findIndex((transfer) => transfer.curl === curl);
+            if (queued !== -1) {
+                const [transfer] = this.queuedAdds.splice(queued, 1);
+                this.curlToAddr.delete(curl);
+                transfer.reject(error);
+                return true;
+            }
+            if (!this.pendingTransfers.has(handleAddr))
+                return false;
+            // The handle is removed once the in-flight poll returns.
+            this.queuedCancels.set(handleAddr, error);
+            this.drive();
+            return true;
+        }
         const pending = this.pendingTransfers.get(handleAddr);
         if (!pending)
             return false;
@@ -382,6 +498,11 @@ export class CurlMulti {
         if (this.closed)
             return;
         this.closed = true;
+        // Let an in-flight curl_multi_poll return before touching the handle
+        if (this.driving) {
+            this.drive();
+            await this.driver;
+        }
         // Fail all pending transfers
         this.failAllPending(new Error("CurlMulti closed"));
         this.stopPolling();

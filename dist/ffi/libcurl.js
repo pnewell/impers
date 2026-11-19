@@ -39,6 +39,20 @@ const curl_easy_perform = lib.func("int curl_easy_perform(void *)");
  * which is critical when the mock server runs in the same process.
  */
 function curl_easy_perform_async(handle) {
+    if (!pinLibraryForAsync()) {
+        return Promise.reject(new Error("Failed to keep libcurl loaded for asynchronous transfers"));
+    }
+    return new Promise((resolve, reject) => {
+        curl_easy_perform
+            .async(handle, (err, code) => {
+            if (err)
+                reject(err);
+            else
+                resolve(code);
+        });
+    });
+}
+function pinLibraryForAsync() {
     if (process.platform === "darwin" && !asyncLibraryPinned) {
         // Koffi can unload libcurl before libuv's workers exit. BoringSSL registers
         // thread-local destructors on those workers, so their code must remain
@@ -51,20 +65,12 @@ function curl_easy_perform_async(handle) {
         const RTLD_NODELETE = 0x80;
         const pinned = dlopen(libraryPath, RTLD_NOW | RTLD_LOCAL | RTLD_NODELETE);
         if (!pinned) {
-            return Promise.reject(new Error("Failed to keep libcurl loaded for asynchronous transfers"));
+            return false;
         }
         dlclose(pinned);
         asyncLibraryPinned = true;
     }
-    return new Promise((resolve, reject) => {
-        curl_easy_perform
-            .async(handle, (err, code) => {
-            if (err)
-                reject(err);
-            else
-                resolve(code);
-        });
-    });
+    return true;
 }
 const curl_easy_duphandle = lib.func("void * curl_easy_duphandle(void *)");
 const curl_easy_reset = lib.func("void curl_easy_reset(void *)");
@@ -201,6 +207,24 @@ function curl_multi_poll(multi, timeoutMs) {
     const code = curl_multi_poll_fn(multi, null, 0, timeoutMs, numfds);
     return { code, numfds: numfds[0] };
 }
+/**
+ * curl_multi_poll on a worker thread via Koffi's .async() support.
+ * Until it settles, only curl_multi_wakeup may be called on the handle.
+ */
+function curl_multi_poll_async(multi, timeoutMs) {
+    if (!pinLibraryForAsync()) {
+        return Promise.reject(new Error("Failed to keep libcurl loaded for asynchronous transfers"));
+    }
+    return new Promise((resolve, reject) => {
+        curl_multi_poll_fn
+            .async(multi, null, 0, timeoutMs, null, (err, code) => {
+            if (err)
+                reject(err);
+            else
+                resolve(code);
+        });
+    });
+}
 // curl_multi_timeout(CURLM *multi, long *timeout)
 const curl_multi_timeout_fn = lib.func("int curl_multi_timeout(void *, _Out_ long *)");
 function curl_multi_timeout(multi) {
@@ -333,7 +357,7 @@ curl_version, curl_version_info,
 // SList
 curl_slist_append, curl_slist_free_all, 
 // Multi interface
-curl_multi_init, curl_multi_cleanup, curl_multi_add_handle, curl_multi_remove_handle, curl_multi_perform, curl_multi_poll, curl_multi_socket_action, curl_multi_timeout, curl_multi_info_read, curl_multi_setopt_long, curl_multi_setopt_ptr, curl_multi_setopt_off_t, curl_multi_strerror, curl_multi_wakeup, 
+curl_multi_init, curl_multi_cleanup, curl_multi_add_handle, curl_multi_remove_handle, curl_multi_perform, curl_multi_poll, curl_multi_poll_async, curl_multi_socket_action, curl_multi_timeout, curl_multi_info_read, curl_multi_setopt_long, curl_multi_setopt_ptr, curl_multi_setopt_off_t, curl_multi_strerror, curl_multi_wakeup, 
 // WebSocket
 curl_ws_recv, curl_ws_send, curl_ws_meta, 
 // MIME
