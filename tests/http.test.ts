@@ -2,11 +2,13 @@
  * Tests for HTTP requests using Session class
  */
 import { gzipSync, deflateSync, brotliCompressSync } from "node:zlib";
+import http2 from "node:http2";
+import type { AddressInfo } from "node:net";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Session } from "../src/http/session.js";
-import { CurlMulti } from "../src/core/multi.js";
+import { CurlOpt, CurlHttpVersion } from "../src/ffi/constants.js";
 import { Headers } from "../src/http/headers.js";
 import { AbortError, get, post, put, del, patch } from "../src/public.js";
 import { Fingerprint, FingerprintManager } from "../src/fingerprints.js";
@@ -493,24 +495,25 @@ describe("Session", () => {
   describe("Bun", () => {
     const versions = process.versions as Record<string, string | undefined>;
     const bunVersion = versions.bun;
-    const multiPerform = CurlMulti.prototype.perform;
+    let bunSession: Session;
 
     beforeEach(() => {
       versions.bun = bunVersion ?? "test";
-      CurlMulti.prototype.perform = () => Promise.reject(new Error("CurlMulti used"));
+      // Uses its own CurlMulti, created while running as Bun
+      bunSession = new Session({ timeout: 10, maxConnections: 10 });
     });
 
-    afterEach(() => {
+    afterEach(async () => {
+      await bunSession.close();
       if (bunVersion === undefined) {
         delete versions.bun;
       } else {
         versions.bun = bunVersion;
       }
-      CurlMulti.prototype.perform = multiPerform;
     });
 
-    it("should perform requests without CurlMulti", async () => {
-      const resp = await session.post(`${globalThis.TEST_SERVER_URL}/post`, {
+    it("should perform requests", async () => {
+      const resp = await bunSession.post(`${globalThis.TEST_SERVER_URL}/post`, {
         json: { runtime: "bun" },
       });
       expect(resp.statusCode).toBe(200);
@@ -519,10 +522,88 @@ describe("Session", () => {
     });
 
     it("should map libcurl errors", async () => {
-      await expect(session.get("http://127.0.0.1:1/")).rejects.toMatchObject({
+      await expect(bunSession.get("http://127.0.0.1:1/")).rejects.toMatchObject({
         name: "ConnectionError",
         curlCode: 7,
       });
+    });
+
+    it("should reuse the connection for sequential requests", async () => {
+      const ports = new Set<number>();
+      for (let i = 0; i < 3; i++) {
+        const resp = await bunSession.get(`${globalThis.TEST_SERVER_URL}/get`);
+        ports.add(resp.localPort);
+      }
+      expect(ports.size).toBe(1);
+    });
+
+    it("should multiplex concurrent HTTP/2 requests over one connection", async () => {
+      let connections = 0;
+      const server = http2.createServer();
+      server.on("session", () => connections++);
+      server.on("stream", (stream) => {
+        setTimeout(() => {
+          stream.respond({ ":status": 200 });
+          stream.end("ok");
+        }, 100);
+      });
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      const { port } = server.address() as AddressInfo;
+
+      try {
+        const responses = await Promise.all(
+          Array.from({ length: 5 }, () =>
+            bunSession.get(`http://127.0.0.1:${port}/`, {
+              curlOptions: {
+                [CurlOpt.HTTP_VERSION]: CurlHttpVersion.CURL_HTTP_VERSION_2_PRIOR_KNOWLEDGE,
+                [CurlOpt.PIPEWAIT]: 1,
+              },
+            })
+          )
+        );
+        expect(responses.map((resp) => resp.statusCode)).toEqual([200, 200, 200, 200, 200]);
+        expect(connections).toBe(1);
+      } finally {
+        await bunSession.close();
+        await new Promise((resolve) => server.close(resolve));
+      }
+    });
+
+    it("should run concurrent requests in parallel", async () => {
+      const start = Date.now();
+      await Promise.all([
+        bunSession.get(`${globalThis.TEST_SERVER_URL}/delay/1`),
+        bunSession.get(`${globalThis.TEST_SERVER_URL}/delay/1`),
+      ]);
+      expect(Date.now() - start).toBeLessThan(2500);
+    });
+
+    it("should abort an in-flight request promptly", async () => {
+      const controller = new AbortController();
+      const start = Date.now();
+      const request = bunSession.get(`${globalThis.TEST_SERVER_URL}/delay/2`, {
+        signal: controller.signal,
+      });
+      setTimeout(() => controller.abort("stop transfer"), 50);
+
+      await expect(request).rejects.toBeInstanceOf(AbortError);
+      expect(Date.now() - start).toBeLessThan(1000);
+    });
+
+    it("should time out", async () => {
+      await expect(
+        bunSession.get(`${globalThis.TEST_SERVER_URL}/delay/2`, { timeout: 0.3 })
+      ).rejects.toMatchObject({ name: "Timeout", curlCode: 28 });
+    });
+
+    it("should reject in-flight requests when closed", async () => {
+      const request = bunSession.get(`${globalThis.TEST_SERVER_URL}/delay/2`);
+      const start = Date.now();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      await bunSession.close();
+
+      await expect(request).rejects.toThrow("CurlMulti closed");
+      expect(Date.now() - start).toBeLessThan(1000);
     });
   });
 });
